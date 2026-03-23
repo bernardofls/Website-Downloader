@@ -934,29 +934,36 @@ class SiteCrawler:
         self.output_dir = output_dir
         self.log = log_callback or print
         self.visited = set()
-        self.page_map = {}  # normalized_url -> absolute path to index.html
+        self.page_map = {}  # normalized_url -> absolute path to saved html file
 
         parsed = urlparse(start_url)
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
-        # Base path scope: only crawl URLs that start with this prefix
-        self.base_path = parsed.path.rstrip('/')
+        # Scope = parent directory of the start URL path.
+        # e.g. "/explorer.htm" → scope "/"
+        #      "/courses/explorer.htm" → scope "/courses"
+        parts = parsed.path.rsplit('/', 1)
+        self.base_path = parts[0] if parts[0] else '/'
 
     def _normalize(self, url):
-        """Strip fragment and trailing slash for consistent keying."""
+        """Strip fragment and trailing slash for consistent map keying."""
         p = urlparse(url)
         path = p.path.rstrip('/') or '/'
         return f"{p.scheme}://{p.netloc}{path}"
 
+    def _abs(self, href, page_url):
+        """Resolve href to an absolute URL relative to page_url."""
+        return urljoin(page_url, href)
+
     def _is_crawlable(self, url):
-        """Return True if the URL is within the crawl scope."""
+        """Return True if the URL is within the crawl scope (same origin, same directory level)."""
         p = urlparse(url)
         if f"{p.scheme}://{p.netloc}" != self.origin:
             return False
-        # Must start with the same base path (or base_path is root)
-        if self.base_path and self.base_path != '/':
-            if not p.path.startswith(self.base_path):
-                return False
-        return True
+        # The URL's directory must be at or under base_path
+        url_dir = p.path.rsplit('/', 1)[0] or '/'
+        if self.base_path == '/':
+            return True
+        return url_dir == self.base_path or url_dir.startswith(self.base_path + '/')
 
     def _url_to_page_dir(self, url):
         """Map a URL to a local output directory, mirroring URL path structure."""
@@ -966,7 +973,7 @@ class SiteCrawler:
             return self.output_dir
         return os.path.join(self.output_dir, *path.split('/'))
 
-    def _extract_links(self, html_path):
+    def _extract_links(self, html_path, page_url):
         """Return crawlable normalized URLs found in <a href> tags."""
         links = []
         try:
@@ -976,15 +983,16 @@ class SiteCrawler:
                 href = a['href']
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#', 'data:')):
                     continue
-                norm = self._normalize(href)
+                # Resolve relative hrefs against the page URL
+                norm = self._normalize(self._abs(href, page_url))
                 if self._is_crawlable(norm) and norm not in self.visited:
                     links.append(norm)
         except Exception as e:
             self.log(f"⚠️ Erro ao extrair links de {html_path}: {e}")
         return list(dict.fromkeys(links))  # deduplicate preserving order
 
-    def _rewrite_links(self, html_path):
-        """Replace absolute page URLs with relative local paths (or '#' if not downloaded)."""
+    def _rewrite_links(self, html_path, page_url):
+        """Replace page URLs with relative local paths (or '#' if not downloaded)."""
         try:
             with open(html_path, encoding='utf-8') as f:
                 soup = BeautifulSoup(f.read(), 'html.parser')
@@ -996,7 +1004,7 @@ class SiteCrawler:
                 href = a['href']
                 if not href or href.startswith(('javascript:', 'mailto:', 'tel:', '#', 'data:')):
                     continue
-                norm = self._normalize(href)
+                norm = self._normalize(self._abs(href, page_url))
                 if norm in self.page_map:
                     rel = os.path.relpath(self.page_map[norm], current_dir)
                     a['href'] = rel
@@ -1030,7 +1038,7 @@ class SiteCrawler:
                 downloader.process()
                 self.page_map[url] = html_path
 
-                new_links = self._extract_links(html_path)
+                new_links = self._extract_links(html_path, url)
                 to_visit.extend(l for l in new_links if l not in self.visited)
                 self.log(f"   🔍 {len(new_links)} novos links encontrados")
             except Exception as e:
@@ -1038,8 +1046,8 @@ class SiteCrawler:
 
         # Second pass: rewrite inter-page links to relative local paths
         self.log(f"\n🔗 Reescrevendo links entre {len(self.page_map)} páginas...")
-        for html_path in self.page_map.values():
-            self._rewrite_links(html_path)
+        for url, html_path in self.page_map.items():
+            self._rewrite_links(html_path, url)
 
         self.log(f"\n✅ Crawl concluído! {len(self.page_map)} páginas baixadas.")
         return len(self.page_map) > 0
