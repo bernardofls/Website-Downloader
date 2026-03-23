@@ -955,15 +955,39 @@ class SiteCrawler:
         return urljoin(page_url, href)
 
     def _is_crawlable(self, url):
-        """Return True if the URL is within the crawl scope (same origin, same directory level)."""
+        """Return True if the URL is within the crawl scope.
+
+        Scope: same origin + same directory level or any parent directory.
+        Subdirectories deeper than base_path are excluded.
+        """
         p = urlparse(url)
         if f"{p.scheme}://{p.netloc}" != self.origin:
             return False
-        # The URL's directory must be at or under base_path
         url_dir = p.path.rsplit('/', 1)[0] or '/'
-        if self.base_path == '/':
-            return True
-        return url_dir == self.base_path or url_dir.startswith(self.base_path + '/')
+        if url_dir == self.base_path:
+            return True   # same level
+        if url_dir == '/':
+            return True   # root is always an ancestor
+        # url_dir is a parent of base_path when base_path starts with url_dir/
+        return self.base_path.startswith(url_dir + '/')
+
+    def _is_reachable(self, url):
+        """Return True if the URL responds with a 2xx HTTP status code."""
+        try:
+            resp = requests.head(
+                url, timeout=10, allow_redirects=True, verify=False,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            if resp.status_code == 405:
+                # HEAD not allowed — fallback to GET with stream to avoid downloading body
+                resp = requests.get(
+                    url, timeout=10, allow_redirects=True, verify=False,
+                    headers={'User-Agent': 'Mozilla/5.0'}, stream=True
+                )
+                resp.close()
+            return resp.status_code < 400
+        except Exception:
+            return False
 
     def _url_to_page_dir(self, url):
         """Map a URL to a local output directory, mirroring URL path structure."""
@@ -1029,7 +1053,12 @@ class SiteCrawler:
                 continue
             self.visited.add(url)
 
-            self.log(f"\n📄 [{len(self.visited)}] Baixando: {url}")
+            # Skip unreachable URLs before attempting a full download
+            if not self._is_reachable(url):
+                self.log(f"   ⏭️ Ignorando (inacessível): {url}")
+                continue
+
+            self.log(f"\n📄 [{len(self.page_map) + 1}] Baixando: {url}")
             page_dir = self._url_to_page_dir(url)
             html_path = os.path.join(page_dir, 'index.html')
 
